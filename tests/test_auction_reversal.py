@@ -28,6 +28,8 @@ from app.models import (
     AuctionTradeReversal,
     Company,
     ComplianceRecord,
+    MrvReport,
+    Quota,
 )
 from app.services.auction_service import (
     SETTLED,
@@ -46,6 +48,7 @@ from app.services.auction_service import (
     run_matching,
     settle_session,
 )
+from app.services.mrv_service import reverse_report
 from app.services.quota_service import allocate_quota
 
 YEAR = 2026
@@ -178,7 +181,12 @@ def _assert_snapshot(db, account_id):
     ec = ef = er = 0.0
     for t in txs:
         ec = round(ec + current_pos.get(t.tx_type, 0) * float(t.amount), 4)
-        ef = round(ef + frozen_pos.get(t.tx_type, 0) * float(t.amount), 4)
+        if t.tx_type == "reversal":
+            # 冲正流水可能只含解冻、只含清缴退还或两者兼有（竞价到账补缴另记
+            # auction_clear_refund），金额无法直接拆分冻结部分，以流水快照为准。
+            ef = float(t.frozen_after or 0)
+        else:
+            ef = round(ef + frozen_pos.get(t.tx_type, 0) * float(t.amount), 4)
         er = round(er + reserved_pos.get(t.tx_type, 0) * float(t.amount), 4)
         assert float(t.balance_after) == approx(ec), f"流水#{t.id} 持仓快照不符（{t.tx_type}）"
         assert float(t.frozen_after or 0) == approx(ef), f"流水#{t.id} 冻结快照不符（{t.tx_type}）"
@@ -738,3 +746,267 @@ class TestReversalConcurrency:
         _assert_snapshot(db, seller1.id)
         _assert_snapshot(db, buyer.id)
         assert float(seller1.current_balance) <= 1000 + 1e-9
+
+
+class TestReportReverseAndTradeReverseOrderIndependent:
+    """报告冲正与竞价成交冲正两条回退链路顺序无关、账本守恒。
+
+    买方带缺口（自有 200 冻结 + 到账 400 补缴，合计清缴 600）成交结算后：
+    - 先成交冲正再报告冲正 / 先报告冲正再成交冲正，最终账户与流水必须一致；
+    - 同一批到账补缴配额最多退还一次，系统总持仓恢复到分配总量，不得凭空增加。
+    """
+
+    def _settled_buyer_with_deficit(self, db, market, trade_qty=400, emission=600):
+        """买方批准报告（冻 200、缺 400）后成交到账 trade_qty 全额补缴。"""
+        buyer = market["B1"]
+        _make_buyer_deficit(db, buyer, emission)
+        s, trade = _settle_trade(db, market["S1"].id, buyer.id, trade_qty)
+        db.expire_all()
+        record = db.query(ComplianceRecord).filter_by(
+            company_id=buyer.id, year=YEAR, is_active=1).one()
+        assert record.status == "compliant"
+        report = db.query(MrvReport).filter_by(
+            company_id=buyer.id, year=YEAR).one()
+        return s, trade, report
+
+    def _system_total(self, db):
+        return round(sum(
+            float(a.current_balance) for a in db.query(AllowanceAccount).all()
+        ), 4)
+
+    def test_trade_reverse_then_report_reverse_conserves(self, db, market):
+        buyer = market["B1"]
+        s, trade, report = self._settled_buyer_with_deficit(db, market)
+        # 卖方甲 600（出库 400）、卖方乙 1000、买方 0（600 已清缴），系统持仓 1600
+        assert self._system_total(db) == approx(1600)
+
+        _reverse(db, s.id)
+        db.commit()
+        db.expire_all()
+        reverse_report(db, db.get(MrvReport, report.id), operator_id=1,
+                       reason="排放数据更正")
+        db.commit()
+        db.expire_all()
+
+        assert self._system_total(db) == approx(2200)
+        assert float(_account(db, market["S1"].id).current_balance) == approx(1000)
+        assert float(_account(db, market["S2"].id).current_balance) == approx(1000)
+        buyer_acc = _account(db, buyer.id)
+        assert float(buyer_acc.current_balance) == approx(200)
+        assert float(buyer_acc.frozen_balance) == approx(0)
+        _assert_snapshot(db, buyer_acc.id)
+        _assert_snapshot(db, _account(db, market["S1"].id).id)
+
+    def test_report_reverse_then_trade_reverse_conserves(self, db, market):
+        """修复前：该顺序把到账补缴 400 退还两次，系统总持仓虚增到 1600。"""
+        buyer = market["B1"]
+        s, trade, report = self._settled_buyer_with_deficit(db, market)
+
+        reverse_report(db, report, operator_id=1, reason="排放数据更正")
+        db.commit()
+        db.expire_all()
+        batch = _reverse(db, s.id)
+        db.commit()
+        db.expire_all()
+
+        assert self._system_total(db) == approx(2200)
+        assert float(batch.recovered_volume) == approx(400)
+        assert float(batch.default_volume) == approx(0)
+        assert float(_account(db, market["S1"].id).current_balance) == approx(1000)
+        buyer_acc = _account(db, buyer.id)
+        assert float(buyer_acc.current_balance) == approx(200)
+        assert float(buyer_acc.frozen_balance) == approx(0)
+        assert db.get(AuctionTrade, trade.id).status == TRADE_REVERSED
+        _assert_snapshot(db, buyer_acc.id)
+        _assert_snapshot(db, _account(db, market["S1"].id).id)
+
+    def test_both_orders_produce_identical_ledger(self, db, market):
+        """两种顺序最终账户余额与按流水类型汇总净额一致（两份独立库对比）。"""
+        import tempfile
+        from pathlib import Path
+
+        from app.services.mrv_service import (
+            approve_report,
+            generate_report,
+            submit_report,
+        )
+
+        def isolated_run(order: str):
+            engine = create_engine(
+                f"sqlite:///{Path(tempfile.mkdtemp()) / 'order.db'}",
+                connect_args={"check_same_thread": False, "timeout": 30},
+            )
+            Base.metadata.create_all(engine)
+            sess = sessionmaker(bind=engine, autoflush=False)()
+
+            comps = {}
+            for code, name, quota in [("S1", "卖方甲", 1000), ("B1", "买方丙", 200)]:
+                c = Company(code=code, name=name, industry="电力", region="华东")
+                sess.add(c)
+                sess.flush()
+                allocate_quota(sess, c.id, YEAR, baseline=quota, allocation_amount=quota)
+                comps[code] = c
+            sess.commit()
+
+            # 买方缺口（冻 200、缺 400）
+            _make_buyer_deficit(sess, comps["B1"], 600)
+            s, trade = _settle_trade(sess, comps["S1"].id, comps["B1"].id, 400)
+            sess.expire_all()
+            report = sess.query(MrvReport).filter_by(
+                company_id=comps["B1"].id, year=YEAR).one()
+
+            if order == "trade_first":
+                _reverse(sess, s.id)
+                sess.commit()
+                sess.expire_all()
+                reverse_report(sess, sess.get(MrvReport, report.id), 1, "报告冲正")
+                sess.commit()
+            else:
+                reverse_report(sess, report, 1, "报告冲正")
+                sess.commit()
+                sess.expire_all()
+                _reverse(sess, s.id)
+                sess.commit()
+            sess.expire_all()
+
+            result = {}
+            for role, cid in (("seller", comps["S1"].id), ("buyer", comps["B1"].id)):
+                acc = sess.query(AllowanceAccount).filter_by(
+                    company_id=cid, year=YEAR).one()
+                rows = (
+                    sess.query(AllowanceTransaction.tx_type, AllowanceTransaction.amount)
+                    .filter(AllowanceTransaction.account_id == acc.id)
+                    .all()
+                )
+                net: dict[str, float] = {}
+                for tx_type, amount in rows:
+                    net[tx_type] = round(net.get(tx_type, 0.0) + float(amount), 4)
+                result[role] = (
+                    float(acc.current_balance),
+                    float(acc.frozen_balance),
+                    float(acc.reserved_balance),
+                    tuple(sorted(net.items())),
+                )
+            sess.close()
+            engine.dispose()
+            return result
+
+        first = isolated_run("report_first")
+        second = isolated_run("trade_first")
+        assert first == second
+
+    def test_report_reverse_marks_per_trade_refund(self, db, market):
+        """报告冲正按成交单写 auction_clear_refund 标记，金额等于该单到账补缴。"""
+        buyer = market["B1"]
+        s, trade, report = self._settled_buyer_with_deficit(db, market)
+
+        reverse_report(db, report, operator_id=1, reason="排放数据更正")
+        db.commit()
+        db.expire_all()
+
+        acc = _account(db, buyer.id)
+        marker = (
+            db.query(AllowanceTransaction)
+            .filter_by(account_id=acc.id, auction_trade_id=trade.id,
+                       tx_type="auction_clear_refund")
+            .one()
+        )
+        assert float(marker.amount) == approx(400)
+        # 冻结解冻仍走通用 reversal 流水，金额只剩冻结 200
+        generic = db.query(AllowanceTransaction).filter_by(
+            account_id=acc.id, tx_type="reversal").one()
+        assert float(generic.amount) == approx(200)
+
+    def test_partial_trade_reverse_then_report_then_remaining(self, db, market):
+        """部分成交冲正 → 报告冲正 → 冲正剩余成交：补缴只退一次，最终守恒。"""
+        buyer = market["B1"]
+        _make_buyer_deficit(db, buyer, 600)  # 冻 200、缺 400
+        s = _open_session(db)
+        place_bid(db, s.id, market["S1"].id, "sell", 100, 80, operator=ADMIN)
+        place_bid(db, s.id, market["S2"].id, "sell", 300, 80, operator=ADMIN)
+        place_bid(db, s.id, buyer.id, "buy", 400, 90, operator=ADMIN)
+        run_matching(db, s.id, ADMIN)
+        settle_session(db, s.id, ADMIN)
+        db.commit()
+        db.expire_all()
+        first, second = (
+            db.query(AuctionTrade).filter_by(session_id=s.id)
+            .order_by(AuctionTrade.alloc_seq.asc()).all()
+        )
+        report = db.query(MrvReport).filter_by(company_id=buyer.id, year=YEAR).one()
+
+        # 先冲正第一笔 100：退还并收回 100
+        _reverse(db, s.id, trade_ids=[first.id])
+        db.commit()
+        db.expire_all()
+        # 卖方甲回补 100（=1000）；卖方乙出库 300（=700）；买方 0 -> 1700
+        assert self._system_total(db) == approx(1700)
+
+        # 报告冲正：解冻 200 + 仅退剩余竞价补缴 300（第一笔 100 已退，不重复）
+        reverse_report(db, db.get(MrvReport, report.id), operator_id=1,
+                       reason="排放数据更正")
+        db.commit()
+        db.expire_all()
+        # 报告冲正后：冻结已在结算时核销（frozen=0），refund=清缴款 500（第一笔
+        # 100 已退），买方入账 200(frozen_clear) + 300(第二笔补缴) = 500；
+        # 卖方乙 700、卖方甲 1000 -> 系统持仓 2200
+        assert self._system_total(db) == approx(2200)
+        buyer_acc = _account(db, buyer.id)
+        assert float(buyer_acc.current_balance) == approx(500)  # 退冻核 200 + 补缴 300
+        assert float(buyer_acc.frozen_balance) == approx(0)
+
+        # 再冲正第二笔：300 补缴已由报告冲正退还，不二次退款，仅自买方收回划卖方
+        batch = _reverse(db, s.id, trade_ids=[second.id])
+        db.commit()
+        db.expire_all()
+        assert float(batch.recovered_volume) == approx(300)
+        assert float(batch.default_volume) == approx(0)
+        # 买方 500 - 300 = 200；卖方乙 700 + 300 = 1000，总额仍 2200
+        assert self._system_total(db) == approx(2200)
+        assert float(_account(db, market["S1"].id).current_balance) == approx(1000)
+        assert float(_account(db, market["S2"].id).current_balance) == approx(1000)
+        assert float(_account(db, buyer.id).current_balance) == approx(200)
+        _assert_snapshot(db, _account(db, buyer.id).id)
+        _assert_snapshot(db, _account(db, market["S2"].id).id)
+
+    def test_report_reverse_then_reapprove_then_trade_reverse(self, db, market):
+        """报告冲正后重新批准新报告，再冲正成交单不得降级新报告的履约/配额状态。"""
+        from app.services.mrv_service import approve_report, generate_report, submit_report
+
+        buyer = market["B1"]
+        s, trade, report = self._settled_buyer_with_deficit(db, market)
+
+        reverse_report(db, report, operator_id=1, reason="排放数据更正")
+        db.commit()
+        db.expire_all()
+
+        # 重新批准：买方此时持仓 600（原 200 + 退还 400），排放 600 可全部冻结
+        new_report = generate_report(db, buyer.id, YEAR)
+        submit_report(db, new_report)
+        approve_report(db, new_report, verifier_id=1)
+        db.commit()
+        db.expire_all()
+        new_record = db.query(ComplianceRecord).filter_by(
+            company_id=buyer.id, year=YEAR, is_active=1).one()
+        # 重新批准时无已清缴、600 全部冻结：deficit=0，状态为 pending（冻结待清缴）
+        assert new_record.status == "pending"
+        assert float(new_record.frozen_amount) == approx(600)
+        quota = db.query(Quota).filter_by(company_id=buyer.id, year=YEAR).one()
+        status_before = quota.status
+        assert float(_account(db, buyer.id).frozen_balance) == approx(600)
+
+        # 冲正成交单：补缴已在报告冲正时退还（c_rev=0），不得改写新记录/配额状态；
+        # 买方自由可用为 0，400 全额登记违约欠额
+        batch = _reverse(db, s.id)
+        db.commit()
+        db.expire_all()
+        assert float(batch.default_volume) == approx(400)
+        quota = db.query(Quota).filter_by(company_id=buyer.id, year=YEAR).one()
+        assert quota.status == status_before
+        record_after = db.query(ComplianceRecord).filter_by(
+            company_id=buyer.id, year=YEAR, is_active=1).one()
+        assert record_after.id == new_record.id
+        assert float(record_after.frozen_amount) == approx(600)
+        assert self._system_total(db) == approx(2200)
+
+

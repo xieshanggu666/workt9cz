@@ -25,9 +25,11 @@
 已结算成交单的监管冲正与违约回退
 ================================
 - reverse_settled_trades：整笔/批量/部分数量冲正，同一事务内回退双方配额划转、
-  按成交单流水归属精确回滚联动清缴（先退自由补缴、后解除冻结），履约记录/配额
-  状态同步回退，冲正单与审计同生共死；买方自由可用不足时只收回可得部分，不足
-  登记违约欠额，卖方由解冻/退还的配额即时补位，不承担敞口；
+  按成交单流水归属精确回滚联动清缴（只退到账补缴，自有冻结核销不随交易回滚），
+  履约记录/配额状态同步回退，冲正单与审计同生共死；买方自由可用不足时只收回
+  可得部分，不足登记违约欠额，卖方由收回/退还的配额即时补位，不承担敞口；
+  与报告冲正链路以流水（auction_deficit_clear/auction_clear_refund）为账本事实
+  幂等去重，两条链路顺序无关、同一批补缴最多退还一次；
 - 违约追偿：recover_buyer_defaults / repay_trade_default 由监管手动触发，
   后续场次结算到账时在清缴后自动追偿（auto_recover_default）；买方自由可用
   划付受影响卖方，欠额结清后成交单 defaulted → reversed；
@@ -1287,11 +1289,18 @@ def settle_session(db: Session, session_id: int, operator: Operator | None) -> A
 #
 # 冲正（reverse）：监管对已结算成交单（支持单笔/批量/部分数量）做异常回退——
 #   1. 回退结算划转：自买方收回配额划付卖方（买方出库/卖方入库冲正流水）；
-#   2. 回滚该笔成交触发的履约清缴：按成交单流水归属精确解除冻结、退还补缴，
-#      履约记录（cleared/frozen/deficit/status）与配额状态同步回退；
+#   2. 回滚该笔成交触发的履约清缴：只退还结算到账触发的自由补缴
+#      （auction_deficit_clear），自有冻结核销与交易取消无关、不回滚；
+#      履约记录（cleared/deficit/status）与配额状态同步回退；
 #   3. 买方自由可用不足时只收回拿得回的部分，不足部分登记违约欠额（defaulted），
-#      受影响卖方已由“先解除冻结/退还”的配额全额补位，不承担敞口；
+#      受影响卖方由收回/退还的配额即时补位，不承担敞口；
 #   4. 全部账户、流水、履约、冲正单、审计在同一事务提交，失败整体回滚。
+#
+# 与报告冲正链路顺序无关：报告冲正也会退还已清缴配额，但两条链路互不调用，
+#   统一以流水为账本事实——成交单应退 = Σ auction_deficit_clear −
+#   Σ auction_clear_refund（后者由本链路或报告冲正任一方写入）。任何先后顺序
+#   （含部分冲正交错、报告冲正后重新批准再冲正旧成交）同一批补缴只退一次；
+#   无清缴可退（c_rev=0）时不改写履约记录/配额状态，只做划转收回。
 #
 # 违约回退（default recovery）：买方事后补足配额（手动或后续场次结算到账自动
 #   追偿），自由可用配额划付受影响卖方并解除违约；先清缴后追偿，绝不挪用履约配额。
@@ -1317,21 +1326,6 @@ def _sum_tx_amount(db: Session, account_id: int, tx_types: list[str], trade_id: 
     return round(float(total or 0.0), 4)
 
 
-def _already_reversed_clearance(db: Session, trade_id: int) -> tuple[float, float]:
-    """该成交单历次冲正已回滚的 (冻结核销, 自由配额补缴) 数量。"""
-    from sqlalchemy import func
-
-    row = (
-        db.query(
-            func.coalesce(func.sum(AuctionTradeReversal.clear_unfrozen), 0),
-            func.coalesce(func.sum(AuctionTradeReversal.clear_refunded), 0),
-        )
-        .filter(AuctionTradeReversal.trade_id == trade_id)
-        .one()
-    )
-    return round(float(row[0] or 0.0), 4), round(float(row[1] or 0.0), 4)
-
-
 def _clearance_rollback_for_qty(
     db: Session,
     buyer_account_id: int,
@@ -1342,12 +1336,19 @@ def _clearance_rollback_for_qty(
 
     只有结算时到账配额触发的自由补缴（auction_deficit_clear，带成交单归属）
     随交易冲正回滚；冻结核销使用买方自有冻结配额，与交易取消无关，不回滚。
-    因此 f 恒为 0，c = min(成交单归属补缴余额, 本次回退量)，天然 ≤ qty。
+    因此 f 恒为 0。
+
+    应退 c 以账本流水为唯一事实：该成交单 auction_deficit_clear 入账合计
+    减去 auction_clear_refund 已退还合计。退还流水可能来自本链路（历次成交
+    冲正），也可能来自报告冲正（报告冲正按成交单写同样的退还标记）——
+    两条回退链路互不感知、先后任意执行，同一批补缴配额最多退还一次，
+    从根本上杜绝“先报告冲正再成交冲正”把同一批配额退还两次、凭空增加
+    系统总配额。c 天然 ≤ qty。
     """
     current_total = _sum_tx_amount(db, buyer_account_id, ["auction_deficit_clear"], trade.id)
-    _f_done, c_done = _already_reversed_clearance(db, trade.id)
-    c_left = round(current_total - c_done, 4)
-    c_rev = round(min(c_left, qty), 4)
+    refunded_total = _sum_tx_amount(db, buyer_account_id, ["auction_clear_refund"], trade.id)
+    c_left = round(current_total - refunded_total, 4)
+    c_rev = round(min(max(c_left, 0.0), qty), 4)
     return 0.0, c_rev
 
 
@@ -1374,8 +1375,19 @@ def _rollback_buyer_compliance(
 
     仅到账补缴 c 随交易冲正回退：``cleared -= c``，对应义务恢复为缺口；
     f（冻结核销）为买方自有配额履约，不随交易回滚，``frozen`` 不变。
+
+    两种必须跳过的情形：
+    - 履约记录已归档（报告冲正在先）：清缴配额已由报告冲正退还并归档，
+      成交冲正不能二次回滚，也不得触碰之后可能已重新批准的新记录；
+    - 本次无任何清缴可回滚（c_rev == 0，例如报告冲正已退还过该成交单的
+      到账补缴）：不得改写履约记录与配额状态（否则可能把重新批准后处于
+      frozen/cleared 的新报告状态错误降为 allocated）。
     """
     from app.models.allowance import ComplianceRecord
+
+    undone = round(f_rev + c_rev, 4)
+    if undone <= 1e-9:
+        return
 
     record = (
         db.query(ComplianceRecord)
@@ -1390,7 +1402,6 @@ def _rollback_buyer_compliance(
         # 报告已冲正归档：清缴配额已由报告冲正退还，不再二次回滚
         return
 
-    undone = round(f_rev + c_rev, 4)
     new_cleared = round(_num(record.cleared_amount) - undone, 4)
     new_frozen = round(max(_num(record.frozen_amount) - f_rev, 0.0), 4)
     emission = round(float(record.verified_emission), 4)
@@ -1544,10 +1555,10 @@ def reverse_settled_trades(
                             db, trade.buyer_id, session.year, f_rev, c_rev
                         )
 
-                        # 2) 自买方自由可用收回：冲正回退后其自由可用 = 结算前自由 + qty
-                        # （解除冻结部分保留履约用途，不参与划付）；可用不足时只收回
-                        # 拿得回的部分，缺口登记为买方违约欠额，卖方已由上面的
-                        # 解冻/退还配额即时补位。
+                        # 2) 自买方自由可用收回：本次实际退还的 c_rev 会即时计入
+                        # 自由可用（解除冻结部分保留履约用途，不参与划付）；报告冲正
+                        # 已退还过的补缴不再重复退还，也就不会凭空增加可收回额度。
+                        # 可用不足时只收回拿得回的部分，缺口登记为买方违约欠额。
                         buyer_acc = db.get(AllowanceAccount, buyer_acc.id)
                         free = round(
                             float(buyer_acc.current_balance)
