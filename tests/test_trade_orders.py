@@ -125,7 +125,7 @@ def _assert_snapshot(db, account_id):
         "frozen_clear": -1, "trade_deliver_out": -1,
         "freeze": 0, "trade_reserve": 0, "trade_release": 0,
     }
-    frozen_signs = {"freeze": 1, "frozen_clear": -1, "reversal": -1}
+    frozen_signs = {"freeze": 1, "frozen_clear": -1, "reversal_unfreeze": -1}
     reserved_signs = {"trade_reserve": 1, "trade_release": -1, "trade_deliver_out": -1}
     exp_c = exp_f = exp_r = 0.0
     for tx in txs:

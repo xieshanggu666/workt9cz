@@ -279,6 +279,31 @@ class TestApprovalFreezeAndReversal:
         assert db.query(ComplianceRecord).filter(ComplianceRecord.is_active == 1).count() == 0
         assert isinstance(report, MrvReport)
 
+    def test_reverse_with_frozen_balance_does_not_inflate_holdings(self, db, seed):
+        """批准即冻结、未清缴即冲正：只解冻不退还，持仓不变（冻结配额从未离开持仓）。
+
+        解冻仅冻结额回落；若把冻结额也加进持仓，系统总配额会凭空增加。
+        """
+        from app.models import AllowanceAccount, AllowanceTransaction
+
+        emission, report = self._calculated_report(db, seed, qty=1000, quota=1000)
+        account = db.query(AllowanceAccount).one()
+        assert float(account.current_balance) == approx(1000)
+        assert float(account.frozen_balance) == approx(emission)
+
+        reverse_report(db, report, operator_id=1, reason="核查数据有误")
+
+        db.expire_all()
+        account = db.query(AllowanceAccount).one()
+        assert float(account.current_balance) == approx(1000)
+        assert float(account.frozen_balance) == approx(0)
+        unfreeze = db.query(AllowanceTransaction).filter_by(tx_type="reversal_unfreeze").one()
+        assert float(unfreeze.amount) == approx(emission)
+        assert float(unfreeze.balance_after) == approx(1000)
+        assert float(unfreeze.frozen_after) == approx(0)
+        # 无已清缴量：不产生退还流水
+        assert db.query(AllowanceTransaction).filter_by(tx_type="reversal").count() == 0
+
     def test_reverse_failure_rolls_back_all_modules(self, db, seed, monkeypatch):
         """冲正过程中任一步失败：报告、履约、余额和流水全部回滚。"""
         from app.models import AllowanceAccount, AllowanceTransaction, ComplianceRecord, MrvReport

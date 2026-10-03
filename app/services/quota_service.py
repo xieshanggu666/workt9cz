@@ -4,7 +4,9 @@
 - 配额分配写入年度配额、账户和入账流水；
 - MRV 报告批准后以报告快照排放量创建/更新履约记录，并冻结可用配额；
 - 清缴优先核销已冻结配额，不足部分再扣减可用配额，买入配额后可补缴缺口；
-- 报告冲正会解冻冻结配额、退还已清缴配额并归档旧履约记录；
+- 报告冲正会解冻冻结配额、退还已清缴配额并归档旧履约记录；其中竞价成交单
+  归属的到账补缴按成交单逐笔退还（auction_clear_refund 关联成交单），与
+  竞价成交冲正共用同一本成交单归属流水账，两条回退链路顺序无关、不重复退还；
 - 余额、冻结额、流水、配额状态、履约记录和报告状态在同一事务提交，
   任一步失败均整体回滚。
 """
@@ -13,7 +15,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import update
+from sqlalchemy import func, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -35,6 +37,7 @@ from app.models.allowance import (
     Quota,
     TradeOrder,
 )
+from app.models.auction import AuctionTrade
 from app.models.company import Company
 from app.models.report import MrvReport
 from app.services.calculation_service import annual_total, count_unverified_activities
@@ -361,6 +364,35 @@ def freeze_allowance_for_report(
         return record
 
 
+def _unrefunded_auction_clearance(db: Session, account_id: int) -> list[tuple[int, float]]:
+    """按成交单汇总账户上“竞价到账补缴”的未退还净额，返回 ``[(成交单id, 净额), …]``。
+
+    竞价结算联动补缴（``auction_deficit_clear``）与两条回退链路的退还
+    （``auction_clear_refund``：报告冲正与成交冲正都会写）均按成交单归属记账，
+    二者差额即仍可退还的补缴量。报告冲正与成交冲正共用同一本成交单归属
+    流水账：任意先后顺序下同一吨补缴最多退还一次，系统总配额守恒。
+    """
+    rows = (
+        db.query(
+            AllowanceTransaction.auction_trade_id,
+            AllowanceTransaction.tx_type,
+            func.coalesce(func.sum(AllowanceTransaction.amount), 0),
+        )
+        .filter(
+            AllowanceTransaction.account_id == account_id,
+            AllowanceTransaction.auction_trade_id.isnot(None),
+            AllowanceTransaction.tx_type.in_(("auction_deficit_clear", "auction_clear_refund")),
+        )
+        .group_by(AllowanceTransaction.auction_trade_id, AllowanceTransaction.tx_type)
+        .all()
+    )
+    nets: dict[int, float] = {}
+    for trade_id, tx_type, total in rows:
+        signed = float(total or 0.0) * (1 if tx_type == "auction_deficit_clear" else -1)
+        nets[int(trade_id)] = round(nets.get(int(trade_id), 0.0) + signed, 4)
+    return [(tid, amt) for tid, amt in sorted(nets.items()) if amt > 1e-9]
+
+
 def reverse_approved_report(
     db: Session,
     report: MrvReport,
@@ -406,22 +438,76 @@ def reverse_approved_report(
                     if account is None:
                         raise ValueError("配额账户缺失，无法安全退还配额，冲正已中止")
                     lock_row_for_write(db, account.id)
-                    # 冻结部分转回可用；已清缴部分曾离开持仓，需重新入账。
+                    # 竞价成交单归属的到账补缴按成交单逐笔退还并关联成交单
+                    # （auction_clear_refund）：监管事后冲正该成交单时，其回退链路
+                    # 按同一本成交单归属流水账计算可退余额，两条回退链路顺序无关，
+                    # 同一吨补缴不会被重复退还（否则系统总配额凭空增加）。
+                    trade_refunds = _unrefunded_auction_clearance(db, account.id)
+                    trade_refund_total = round(sum(amt for _, amt in trade_refunds), 4)
+                    # 成交单归属补缴必然已计入 cleared；防御性封顶，退还总额不超过已清缴量
+                    trade_refund_total = min(trade_refund_total, cleared)
+                    cleared_refund = round(cleared - trade_refund_total, 4)
+
+                    # 1) 解冻：冻结配额从未离开持仓，仅冻结额回落、持仓不变
+                    # （若把冻结额也加进持仓，系统总配额会凭空增加）。
+                    if frozen > 0:
+                        balance_after, frozen_after, reserved_after = apply_ledger_delta(
+                            db, account.id, 0, -frozen, 0
+                        )
+                        _add_ledger_tx(
+                            db,
+                            account,
+                            "reversal_unfreeze",
+                            frozen,
+                            balance_after,
+                            frozen_after,
+                            "报告冲正",
+                            f"{year}年度报告冲正：解除履约冻结 {frozen} 吨",
+                            reserved_after=reserved_after,
+                        )
+
+                    # 2) 非成交单归属的已清缴部分曾离开持仓，重新入账。
                     # 交易占用（reserved）不受影响，退还的配额成为可交易的自由配额。
-                    balance_after, frozen_after, reserved_after = apply_ledger_delta(
-                        db, account.id, refund, -frozen, 0
-                    )
-                    _add_ledger_tx(
-                        db,
-                        account,
-                        "reversal",
-                        refund,
-                        balance_after,
-                        frozen_after,
-                        "报告冲正",
-                        f"{year}年度报告冲正：解冻{frozen}吨，退还清缴{cleared}吨",
-                        reserved_after=reserved_after,
-                    )
+                    if cleared_refund > 0:
+                        balance_after, frozen_after, reserved_after = apply_ledger_delta(
+                            db, account.id, cleared_refund, 0, 0
+                        )
+                        _add_ledger_tx(
+                            db,
+                            account,
+                            "reversal",
+                            cleared_refund,
+                            balance_after,
+                            frozen_after,
+                            "报告冲正",
+                            f"{year}年度报告冲正：退还已清缴配额 {cleared_refund} 吨",
+                            reserved_after=reserved_after,
+                        )
+
+                    # 3) 成交单归属的已清缴部分按成交单逐笔退还（关联成交单）。
+                    budget = trade_refund_total
+                    for trade_id, net in trade_refunds:
+                        if budget <= 1e-9:
+                            break
+                        amount = round(min(net, budget), 4)
+                        budget = round(budget - amount, 4)
+                        trade = db.get(AuctionTrade, trade_id)
+                        trade_no = trade.trade_no if trade else str(trade_id)
+                        balance_after, frozen_after, reserved_after = apply_ledger_delta(
+                            db, account.id, amount, 0, 0
+                        )
+                        _add_ledger_tx(
+                            db,
+                            account,
+                            "auction_clear_refund",
+                            amount,
+                            balance_after,
+                            frozen_after,
+                            "报告冲正",
+                            f"{year}年度报告冲正：退还成交单 {trade_no} 归属的到账补缴 {amount} 吨",
+                            reserved_after=reserved_after,
+                            auction_trade_id=trade_id,
+                        )
 
                 record.is_active = 0
                 record.status = "reversed"

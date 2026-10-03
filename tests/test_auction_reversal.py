@@ -122,7 +122,7 @@ def _settle_trade(db, seller_id, buyer_id, qty, bid_price=80, ask_price=80,
 
 
 def _make_buyer_deficit(db, company, emission, factor=0.5703):
-    """构造买方年度缺口：活动数据→核算→报告批准（冻结+缺口）。"""
+    """构造买方年度缺口：活动数据→核算→报告批准（冻结+缺口）。返回已批准报告。"""
     from app.models import ActivityData, CalculationMethod, EmissionFactor, EmissionScope
     from app.services.calculation_service import recalc_company_year
     from app.services.mrv_service import approve_report, generate_report, submit_report
@@ -145,6 +145,7 @@ def _make_buyer_deficit(db, company, emission, factor=0.5703):
     submit_report(db, report)
     approve_report(db, report, verifier_id=1)
     db.commit()
+    return report
 
 
 def _assert_snapshot(db, account_id):
@@ -168,7 +169,7 @@ def _assert_snapshot(db, account_id):
         "auction_reserve": 0, "auction_reserve_release": 0,
         "auction_bid_reserve": 0, "auction_bid_release": 0,
     }
-    frozen_pos = {"freeze": 1, "frozen_clear": -1, "reversal": -1,
+    frozen_pos = {"freeze": 1, "frozen_clear": -1, "reversal_unfreeze": -1,
                   "auction_clear_unfreeze": -1}
     reserved_pos = {
         "trade_reserve": 1, "trade_release": -1, "trade_deliver_out": -1,
@@ -738,3 +739,169 @@ class TestReversalConcurrency:
         _assert_snapshot(db, seller1.id)
         _assert_snapshot(db, buyer.id)
         assert float(seller1.current_balance) <= 1000 + 1e-9
+
+
+class TestReportAndTradeReversalOrder:
+    """报告冲正与竞价成交冲正两条回退链路：任意先后顺序下账本守恒、不重复退还。
+
+    公共场景：买方 200 吨配额、批准排放 500（冻结 200、缺口 300）；
+    竞价买入 300 结算到账全部补缴缺口（auction_deficit_clear 300 归属成交单），
+    买方持仓 0、卖方 700、履约 cleared=500 达标。
+    两条链路共用同一本成交单归属流水账（auction_deficit_clear − auction_clear_refund），
+    同一吨归属补缴无论谁先谁后最多退还一次。
+    """
+
+    def _settled_with_clearance(self, db, market):
+        buyer = market["B1"]
+        report = _make_buyer_deficit(db, buyer, 500)
+        s, trade = _settle_trade(db, market["S1"].id, buyer.id, 300)
+        record = db.query(ComplianceRecord).filter_by(
+            company_id=buyer.id, year=YEAR, is_active=1).one()
+        assert record.status == "compliant"
+        assert float(record.cleared_amount) == approx(500)
+        assert float(_account(db, buyer.id).current_balance) == 0
+        return report, s, trade
+
+    def test_report_reversal_then_trade_reversal_no_double_refund(self, db, market):
+        """先冲正报告再冲正成交：归属补缴只退一次，双方回到结算前，总量守恒。"""
+        from app.services.mrv_service import reverse_report
+
+        buyer, seller = market["B1"], market["S1"]
+        report, s, trade = self._settled_with_clearance(db, market)
+
+        # 报告冲正：退还已清缴 500，其中归属成交单的 300 逐笔退还并关联成交单
+        reverse_report(db, report, operator_id=1, reason="核查数据有误")
+        db.expire_all()
+        assert float(_account(db, buyer.id).current_balance) == approx(500)
+        refunds = (
+            db.query(AllowanceTransaction)
+            .filter_by(tx_type="auction_clear_refund", auction_trade_id=trade.id)
+            .all()
+        )
+        assert sum(float(t.amount) for t in refunds) == approx(300)
+        # 非成交单归属的 200 走汇总退还流水，归属成交单的部分不在其中
+        reversal_tx = db.query(AllowanceTransaction).filter_by(tx_type="reversal").one()
+        assert float(reversal_tx.amount) == approx(200)
+
+        # 再冲正成交：归属补缴已随报告冲正退还（c_rev=0），不再二次退还；仅收回 300
+        batch = _reverse(db, s.id)
+        db.expire_all()
+        assert float(batch.recovered_volume) == approx(300)
+        assert float(batch.default_volume) == 0
+        rev = db.query(AuctionTradeReversal).one()
+        assert float(rev.clear_refunded) == approx(0)
+        assert float(rev.recovered_quantity) == approx(300)
+        assert db.get(AuctionTrade, trade.id).status == TRADE_REVERSED
+
+        # 双方回到结算前：买方 200、卖方 1000，系统总量 1200 守恒
+        assert float(_account(db, buyer.id).current_balance) == approx(200)
+        assert float(_account(db, seller.id).current_balance) == approx(1000)
+        _assert_snapshot(db, _account(db, buyer.id).id)
+        _assert_snapshot(db, _account(db, seller.id).id)
+
+    def test_trade_reversal_then_report_reversal_same_final_state(self, db, market):
+        """先冲正成交再冲正报告：最终状态与先冲报告完全一致（顺序无关）。"""
+        from app.services.mrv_service import reverse_report
+
+        buyer, seller = market["B1"], market["S1"]
+        report, s, trade = self._settled_with_clearance(db, market)
+
+        _reverse(db, s.id)
+        db.expire_all()
+        record = db.query(ComplianceRecord).filter_by(
+            company_id=buyer.id, year=YEAR, is_active=1).one()
+        assert float(record.cleared_amount) == approx(200)
+        assert float(_account(db, buyer.id).current_balance) == approx(0)
+
+        reverse_report(db, report, operator_id=1, reason="核查数据有误")
+        db.expire_all()
+        # 与“先冲报告再冲成交”相同的终态
+        assert float(_account(db, buyer.id).current_balance) == approx(200)
+        assert float(_account(db, seller.id).current_balance) == approx(1000)
+        _assert_snapshot(db, _account(db, buyer.id).id)
+        _assert_snapshot(db, _account(db, seller.id).id)
+
+    def test_partial_trade_reversal_report_reversal_then_remaining(self, db, market):
+        """部分冲正 → 报告冲正 → 剩余冲正：归属补缴累计退还恰为 300，不重复。"""
+        from app.services.mrv_service import reverse_report
+
+        buyer, seller = market["B1"], market["S1"]
+        report, s, trade = self._settled_with_clearance(db, market)
+
+        # 先部分冲正 100：退还归属补缴 100 并收回划付卖方
+        _reverse(db, s.id, quantities={trade.id: 100})
+        db.expire_all()
+        assert float(_account(db, buyer.id).current_balance) == approx(0)
+        assert float(_account(db, seller.id).current_balance) == approx(800)
+
+        # 报告冲正：剩余归属补缴 200 按成交单退还，另退非归属清缴 200
+        reverse_report(db, report, operator_id=1, reason="核查数据有误")
+        db.expire_all()
+        assert float(_account(db, buyer.id).current_balance) == approx(400)
+
+        # 剩余 200 冲正：归属补缴已退完（c_rev=0），仅收回 200 划付卖方
+        _reverse(db, s.id)
+        db.expire_all()
+        t = db.get(AuctionTrade, trade.id)
+        assert t.status == TRADE_REVERSED
+        assert float(t.reversed_quantity) == approx(300)
+        refunds = (
+            db.query(AllowanceTransaction)
+            .filter_by(tx_type="auction_clear_refund", auction_trade_id=trade.id)
+            .all()
+        )
+        assert sum(float(x.amount) for x in refunds) == approx(300)
+        assert float(_account(db, buyer.id).current_balance) == approx(200)
+        assert float(_account(db, seller.id).current_balance) == approx(1000)
+        _assert_snapshot(db, _account(db, buyer.id).id)
+        _assert_snapshot(db, _account(db, seller.id).id)
+
+    def test_report_reversal_reapprove_then_trade_reversal(self, db, market):
+        """报告冲正→重新批准→冲正旧成交：新履约记录不被污染，追偿后总量守恒。"""
+        from app.services.mrv_service import (
+            approve_report,
+            generate_report,
+            reverse_report,
+            submit_report,
+        )
+
+        buyer, seller = market["B1"], market["S1"]
+        report, s, trade = self._settled_with_clearance(db, market)
+
+        reverse_report(db, report, operator_id=1, reason="核查数据有误")
+        # 重新生成并批准（排放不变）：新履约记录冻结 500、cleared=0
+        report2 = generate_report(db, buyer.id, YEAR)
+        submit_report(db, report2)
+        approve_report(db, report2, verifier_id=1)
+        db.commit()
+        record2 = db.query(ComplianceRecord).filter_by(
+            company_id=buyer.id, year=YEAR, is_active=1).one()
+        assert float(record2.cleared_amount) == approx(0)
+        assert float(record2.frozen_amount) == approx(500)
+
+        # 冲正旧成交：归属补缴已随首次报告冲正退还（c_rev=0），新记录不被回滚；
+        # 买方自由可用为 0（全部冻结），收回 0、登记违约 300
+        _reverse(db, s.id)
+        db.expire_all()
+        t = db.get(AuctionTrade, trade.id)
+        assert t.status == TRADE_DEFAULTED
+        assert float(t.defaulted_amount) == approx(300)
+        record2 = db.query(ComplianceRecord).filter_by(
+            company_id=buyer.id, year=YEAR, is_active=1).one()
+        assert float(record2.cleared_amount) == approx(0)
+        assert float(record2.frozen_amount) == approx(500)
+        assert float(record2.deficit) == approx(0)
+        assert record2.status == "pending"
+
+        # 冲正新报告解除冻结（cleared=0：只解冻不退还，持仓不变），再追偿欠额
+        reverse_report(db, report2, operator_id=1, reason="再次更正")
+        db.expire_all()
+        assert float(_account(db, buyer.id).current_balance) == approx(500)
+        assert float(_account(db, buyer.id).frozen_balance) == approx(0)
+        repay_trade_default(db, trade.id, ADMIN)
+        db.expire_all()
+        assert db.get(AuctionTrade, trade.id).status == TRADE_REVERSED
+        assert float(_account(db, buyer.id).current_balance) == approx(200)
+        assert float(_account(db, seller.id).current_balance) == approx(1000)
+        _assert_snapshot(db, _account(db, buyer.id).id)
+        _assert_snapshot(db, _account(db, seller.id).id)

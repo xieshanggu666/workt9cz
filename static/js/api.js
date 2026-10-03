@@ -69,6 +69,7 @@ const txLabel = {
   freeze: "履约冻结",
   frozen_clear: "冻结清缴",
   reversal: "报告冲正退还",
+  reversal_unfreeze: "报告冲正解冻",
   clear: "履约清缴",
   trade_reserve: "订单交易占用",
   trade_release: "撤销释放占用",

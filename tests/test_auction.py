@@ -134,7 +134,7 @@ def _assert_snapshot(db, account_id):
         "auction_reserve": 0, "auction_reserve_release": 0,
         "auction_bid_reserve": 0, "auction_bid_release": 0,
     }
-    frozen_pos = {"freeze": 1, "frozen_clear": -1, "reversal": -1}
+    frozen_pos = {"freeze": 1, "frozen_clear": -1, "reversal_unfreeze": -1}
     reserved_pos = {
         "trade_reserve": 1, "trade_release": -1, "trade_deliver_out": -1,
         "auction_reserve": 1, "auction_reserve_release": -1, "auction_deliver_out": -1,

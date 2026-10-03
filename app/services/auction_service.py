@@ -1293,6 +1293,11 @@ def settle_session(db: Session, session_id: int, operator: Operator | None) -> A
 #      受影响卖方已由“先解除冻结/退还”的配额全额补位，不承担敞口；
 #   4. 全部账户、流水、履约、冲正单、审计在同一事务提交，失败整体回滚。
 #
+# 与报告冲正的顺序无关性：报告冲正退还已清缴配额时，把成交单归属的到账补缴
+#   按成交单逐笔写 auction_clear_refund；本链路计算可退余额同样以成交单归属
+#   流水账（auction_deficit_clear − auction_clear_refund）为准。两条回退链路
+#   共用同一本账，任意先后顺序下同一吨补缴最多退还一次，系统总配额守恒。
+#
 # 违约回退（default recovery）：买方事后补足配额（手动或后续场次结算到账自动
 #   追偿），自由可用配额划付受影响卖方并解除违约；先清缴后追偿，绝不挪用履约配额。
 
@@ -1317,21 +1322,6 @@ def _sum_tx_amount(db: Session, account_id: int, tx_types: list[str], trade_id: 
     return round(float(total or 0.0), 4)
 
 
-def _already_reversed_clearance(db: Session, trade_id: int) -> tuple[float, float]:
-    """该成交单历次冲正已回滚的 (冻结核销, 自由配额补缴) 数量。"""
-    from sqlalchemy import func
-
-    row = (
-        db.query(
-            func.coalesce(func.sum(AuctionTradeReversal.clear_unfrozen), 0),
-            func.coalesce(func.sum(AuctionTradeReversal.clear_refunded), 0),
-        )
-        .filter(AuctionTradeReversal.trade_id == trade_id)
-        .one()
-    )
-    return round(float(row[0] or 0.0), 4), round(float(row[1] or 0.0), 4)
-
-
 def _clearance_rollback_for_qty(
     db: Session,
     buyer_account_id: int,
@@ -1342,12 +1332,14 @@ def _clearance_rollback_for_qty(
 
     只有结算时到账配额触发的自由补缴（auction_deficit_clear，带成交单归属）
     随交易冲正回滚；冻结核销使用买方自有冻结配额，与交易取消无关，不回滚。
-    因此 f 恒为 0，c = min(成交单归属补缴余额, 本次回退量)，天然 ≤ qty。
+    可退余额按成交单归属流水账计算：补缴合计 − 已退还合计。报告冲正退还
+    已清缴配额时同样按成交单写 auction_clear_refund，两条回退链路共用
+    同一本账，先后顺序无关、同一吨补缴不会被重复退还。
     """
-    current_total = _sum_tx_amount(db, buyer_account_id, ["auction_deficit_clear"], trade.id)
-    _f_done, c_done = _already_reversed_clearance(db, trade.id)
-    c_left = round(current_total - c_done, 4)
-    c_rev = round(min(c_left, qty), 4)
+    cleared_total = _sum_tx_amount(db, buyer_account_id, ["auction_deficit_clear"], trade.id)
+    refunded_total = _sum_tx_amount(db, buyer_account_id, ["auction_clear_refund"], trade.id)
+    c_left = round(cleared_total - refunded_total, 4)
+    c_rev = round(min(max(c_left, 0.0), qty), 4)
     return 0.0, c_rev
 
 
@@ -1391,6 +1383,11 @@ def _rollback_buyer_compliance(
         return
 
     undone = round(f_rev + c_rev, 4)
+    if undone <= 0:
+        # 无可回滚清缴（例如报告冲正已退还、履约记录已重建）：
+        # 不得触碰当前活跃记录，避免污染重新批准后的履约结果
+        return
+
     new_cleared = round(_num(record.cleared_amount) - undone, 4)
     new_frozen = round(max(_num(record.frozen_amount) - f_rev, 0.0), 4)
     emission = round(float(record.verified_emission), 4)

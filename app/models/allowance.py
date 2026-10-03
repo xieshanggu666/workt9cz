@@ -63,7 +63,8 @@ class AllowanceTransaction(Base):
     id = Column(Integer, primary_key=True)
     account_id = Column(Integer, ForeignKey("allowance_accounts.id"), nullable=False, index=True)
     company_id = Column(Integer, ForeignKey("companies.id"), nullable=False, index=True)
-    # allocation/buy/sell/transfer_in/transfer_out/freeze/clear/frozen_clear/offset/reversal/
+    # allocation/buy/sell/transfer_in/transfer_out/freeze/clear/frozen_clear/offset/
+    # reversal（报告冲正退还已清缴）/reversal_unfreeze（报告冲正解除冻结）/
     # trade_reserve/trade_release/trade_deliver_out/trade_deliver_in/
     # auction_bid_reserve/auction_bid_release/auction_reserve_release/
     # auction_deliver_out/auction_deliver_in/auction_deficit_clear/

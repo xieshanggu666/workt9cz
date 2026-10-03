@@ -187,17 +187,12 @@ def _assert_snapshot(db, account_id):
         "frozen_clear": -1, "trade_deliver_out": -1, "trade_deficit_clear": -1,
         "freeze": 0, "trade_reserve": 0, "trade_release": 0,
     }
-    frozen_signs = {"freeze": 1, "frozen_clear": -1, "reversal": -1}
+    frozen_signs = {"freeze": 1, "frozen_clear": -1, "reversal_unfreeze": -1}
     reserved_signs = {"trade_reserve": 1, "trade_release": -1, "trade_deliver_out": -1}
     exp_c = exp_f = exp_r = 0.0
     for tx in txs:
         exp_c = round(exp_c + current_signs.get(tx.tx_type, 0) * float(tx.amount), 4)
-        if tx.tx_type == "reversal":
-            # 冲正流水金额 = 解冻额 + 已清缴退还额，冻结只回落其中冻结部分，
-            # 无法仅凭金额拆分；冲正后冻结必为归档记录的残余冻结（0），以快照为准。
-            exp_f = float(tx.frozen_after or 0)
-        else:
-            exp_f = round(exp_f + frozen_signs.get(tx.tx_type, 0) * float(tx.amount), 4)
+        exp_f = round(exp_f + frozen_signs.get(tx.tx_type, 0) * float(tx.amount), 4)
         exp_r = round(exp_r + reserved_signs.get(tx.tx_type, 0) * float(tx.amount), 4)
         assert float(tx.balance_after) == approx(exp_c), f"流水#{tx.id} 持仓快照不符"
         assert float(tx.frozen_after or 0) == approx(exp_f), f"流水#{tx.id} 冻结快照不符"
